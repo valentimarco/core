@@ -15,7 +15,7 @@ from langchain.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableConfig
 from langchain_core.prompts.chat import SystemMessagePromptTemplate
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda
-from langchain.callbacks.tracers import ConsoleCallbackHandler
+from langchain_core.language_models import BaseLanguageModel
 
 from cat.mad_hatter.plugin import Plugin
 from cat.mad_hatter.mad_hatter import MadHatter
@@ -27,6 +27,7 @@ from cat.log import log
 from cat.env import get_env
 from cat.looking_glass.callbacks import NewTokenHandler
 from cat.experimental.form import CatForm, CatFormState
+from cat.factory.llm import LLMOllamaConfig
 
 
 class AgentManager:
@@ -50,14 +51,18 @@ class AgentManager:
         else:
             self.verbose = False
 
-
     async def execute_procedures_agent(self, agent_input, stray):
-        
         def get_recalled_procedures_names():
             recalled_procedures_names = set()
             for p in stray.working_memory.procedural_memories:
                 procedure = p[0]
-                if procedure.metadata["type"] in ["tool", "form"] and procedure.metadata["trigger_type"] in ["description", "start_example"]:
+                if procedure.metadata["type"] in [
+                    "tool",
+                    "form",
+                ] and procedure.metadata["trigger_type"] in [
+                    "description",
+                    "start_example",
+                ]:
                     recalled_procedures_names.add(procedure.metadata["source"])
             return recalled_procedures_names
 
@@ -77,7 +82,7 @@ class AgentManager:
                             return_direct_tools.append(tool.name)
                     else:
                         allowed_procedures[p.name] = p
-            
+
             return allowed_procedures, allowed_tools, return_direct_tools
 
         def generate_examples():
@@ -86,19 +91,10 @@ class AgentManager:
                 if proc.start_examples:
                     if not list_examples:
                         list_examples += "## Here some examples:\n"
-                    example_json = f"""
-                    {{
-                        "action": "{proc.name}",
-                        "action_input": // Input of the action according to its description
-                    }}"""
+                    example_json = f"""{{\t"action": "{proc.name}",\n\t"action_input": // Input of the action according to its description\n}}"""
                     list_examples += f"\nQuestion: {random.choice(proc.start_examples)}"
                     list_examples += f"\n```json\n{example_json}\n```"
-                    list_examples += """```json
-                    {{
-                        "action": "final_answer",
-                        "action_input": null
-                    }}
-                    ```"""
+                    list_examples += """\n```json\n{\n\t"action": "final_answer",\n\t"action_input": null\n}\n```"""
             return list_examples
 
         def generate_scratchpad(intermediate_steps):
@@ -111,7 +107,11 @@ class AgentManager:
                 """
             return thoughts
 
-        def process_intermediate_steps(out, return_direct_tools: List[str], allowed_procedures: Dict[str, Union[CatTool, CatForm]]):
+        def process_intermediate_steps(
+            out,
+            return_direct_tools: List[str],
+            allowed_procedures: Dict[str, Union[CatTool, CatForm]],
+        ):
             """
             Process intermediate steps and check if any tool is decorated with return_direct=True.
             Also, include forms in the intermediate steps and handle their selection.
@@ -123,7 +123,7 @@ class AgentManager:
                 intermediate_steps.append(((step[0].tool, step[0].tool_input), step[1]))
                 if step[0].tool in return_direct_tools:
                     out["return_direct"] = True
-            
+
             out["intermediate_steps"] = intermediate_steps
 
             if "form" in out:
@@ -141,27 +141,49 @@ class AgentManager:
 
         # Gather recalled procedures
         recalled_procedures_names = get_recalled_procedures_names()
-        recalled_procedures_names = self.mad_hatter.execute_hook("agent_allowed_tools", recalled_procedures_names, cat=stray)
+        recalled_procedures_names = self.mad_hatter.execute_hook(
+            "agent_allowed_tools", recalled_procedures_names, cat=stray
+        )
 
         # Prepare allowed procedures
-        allowed_procedures, allowed_tools, return_direct_tools = prepare_allowed_procedures()
+        allowed_procedures, allowed_tools, return_direct_tools = (
+            prepare_allowed_procedures()
+        )
 
         # Generate the prompt
-        prompt = ChatPromptTemplate.from_messages([
-            SystemMessagePromptTemplate.from_template(
-                template=self.mad_hatter.execute_hook("agent_prompt_instructions", prompts.TOOL_PROMPT, cat=stray)
-            ),
-            # *(stray.langchainfy_chat_history())
-        ])
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                SystemMessagePromptTemplate.from_template(
+                    template=self.mad_hatter.execute_hook(
+                        "agent_prompt_instructions", prompts.TOOL_PROMPT, cat=stray
+                    )
+                ),
+                # *(stray.langchainfy_chat_history())
+            ]
+        )
 
         # Partial the prompt with relevant data
         prompt = prompt.partial(
-            tools="\n".join(f"- {tool.name}: {tool.description}" for tool in allowed_procedures.values()),
+            tools="\n".join(
+                f"- {tool.name}: {tool.description}"
+                for tool in allowed_procedures.values()
+            ),
             tool_names=", ".join(allowed_procedures.keys()),
             agent_scratchpad="",
             chat_history=stray.stringify_chat_history(),
             examples=generate_examples(),
         )
+
+        # Try binding tools if langchain's Chat/Text provider model support fuction calling (OpenAI)
+        model = stray._llm
+        try:
+            model = model.bind_tools(tools=allowed_tools)
+        except NotImplementedError:
+            # the model doesn't implement `bind_tools` method
+            log.info(
+                f"The model {stray._llm} doesn't support function calling in langchain!!"
+            )
+            self.change_model_behavior(model=model, ollama={"format_json": True})
 
         # Create the agent
         agent = (
@@ -170,7 +192,7 @@ class AgentManager:
             )
             | prompt
             | RunnableLambda(lambda x: self.__log_prompt(x))
-            | stray._llm
+            | model
             | ChooseProcedureOutputParser()
         )
 
@@ -211,7 +233,7 @@ class AgentManager:
                 SystemMessagePromptTemplate.from_template(
                     template=prompt_prefix + prompt_suffix
                 ),
-                *(stray.langchainfy_chat_history())
+                *(stray.langchainfy_chat_history()),
             ]
         )
 
@@ -223,10 +245,9 @@ class AgentManager:
         )
 
         agent_input["output"] = memory_chain.invoke(
-            agent_input, 
-            config=RunnableConfig(callbacks=[NewTokenHandler(stray)])
+            agent_input, config=RunnableConfig(callbacks=[NewTokenHandler(stray)])
         )
-        
+
         return agent_input
 
     async def execute_agent(self, stray):
@@ -299,6 +320,9 @@ class AgentManager:
                 log.error(e)
                 traceback.print_exc()
 
+        # Reset any model changes
+        self.change_model_behavior(stray._llm, ollama={"format_json": True})
+
         # we run memory chain if:
         # - no procedures where recalled or selected or
         # - procedures have all return_direct=False or
@@ -344,17 +368,19 @@ class AgentManager:
         )
 
         # format conversation history to be inserted in the prompt
-        #conversation_history_formatted_content = stray.stringify_chat_history()
+        # conversation_history_formatted_content = stray.stringify_chat_history()
 
         return {
             "input": stray.working_memory.user_message_json.text,  # TODO: deprecate, since it is included in chat history
             "episodic_memory": episodic_memory_formatted_content,
             "declarative_memory": declarative_memory_formatted_content,
-            #"chat_history": conversation_history_formatted_content,
+            # "chat_history": conversation_history_formatted_content,
             "tools_output": "",
         }
 
-    def agent_prompt_episodic_memories(self, memory_docs: List[Tuple[Document, float]]) -> str:
+    def agent_prompt_episodic_memories(
+        self, memory_docs: List[Tuple[Document, float]]
+    ) -> str:
         """Formats episodic memories to be inserted into the prompt.
 
         Parameters
@@ -400,7 +426,9 @@ class AgentManager:
 
         return memory_content
 
-    def agent_prompt_declarative_memories(self, memory_docs: List[Tuple[Document, float]]) -> str:
+    def agent_prompt_declarative_memories(
+        self, memory_docs: List[Tuple[Document, float]]
+    ) -> str:
         """Formats the declarative memories for the prompt context.
         Such context is placed in the `agent_prompt_prefix` in the place held by {declarative_memory}.
 
@@ -444,7 +472,15 @@ class AgentManager:
         return memory_content
 
     def __log_prompt(self, x):
-            #The names are not shown in the chat history log, the model however receives the name correctly
-            log.info("The names are not shown in the chat history log, the model however receives the name correctly")            
-            print("\n",get_colored_text(x.to_string(),"green"))
-            return x
+        # The names are not shown in the chat history log, the model however receives the name correctly
+        log.info(
+            "The names are not shown in the chat history log, the model however receives the name correctly"
+        )
+        print("\n", get_colored_text(x.to_string(), "green"))
+        return x
+
+    def change_model_behavior(self, model: BaseLanguageModel, **kwargs):
+        if isinstance(model, LLMOllamaConfig) and "ollama" in kwargs:
+            format_json: bool = kwargs["ollama"].get("format_json", False)
+            model.format = "json" if format_json else None
+            log.info(f"Ollama json grammar status: {format_json}")
