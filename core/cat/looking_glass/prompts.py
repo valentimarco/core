@@ -60,12 +60,12 @@ class ToolPromptTemplate(StringPromptTemplate):
 TOOL_PROMPT = """Create a JSON action to complete the action sequence, with the correct "action" and "action_input" to help the Human.
 You can use one of these actions:
 {tools}
-- "final_answer": Use this action to finish or no relevant action is available. Input is always null.
+- final_answer: Use this action to finish or no relevant action is available. Input is always null.
 
 ## To add an action, use only the following format:
 ```json
 {{
-    "action": // str - The name of the action to take, should be one of [{tool_names}, "final_answer"]
+    "action": // str - The name of the action to take, should be one of [{tool_names}, final_answer]
     "action_input": // str or null - The input to the action
 }}
 ```
