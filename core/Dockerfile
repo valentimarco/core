@@ -8,6 +8,9 @@ ENV WATCHFILES_FORCE_POLLING=true
 RUN apt-get -y update && apt-get install -y curl build-essential fastjar libmagic-mgc libmagic1 mime-support && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
+### Installing astral uv ###
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.cargo/bin/:$PATH"
 
 ### ADMIN (static build) ###
 WORKDIR /admin
@@ -18,9 +21,14 @@ COPY ./pyproject.toml /app/pyproject.toml
 
 ### INSTALL PYTHON DEPENDENCIES (Core) ###
 WORKDIR /app
-RUN pip install -U pip && \
-    pip install --no-cache-dir . &&\
-    python3 -c "import nltk; nltk.download('punkt');nltk.download('averaged_perceptron_tagger')"
+
+RUN uv venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+
+RUN uv pip install -r pyproject.toml
+RUN python3 -c "import nltk; nltk.download('punkt');nltk.download('averaged_perceptron_tagger')"
 
 ### COPY CAT CODE INSIDE THE CONTAINER (so it can be run standalone) ###
 COPY ./cat /app/cat
